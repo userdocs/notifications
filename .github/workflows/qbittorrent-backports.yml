@@ -1,0 +1,36 @@
+name: Monitor Backport PRs
+
+on:
+  pull_request:
+    types: [opened, edited]
+
+jobs:
+  check-and-notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR Title
+        id: match-title
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          echo "Checking PR Title: $PR_TITLE"
+          
+          # Regex matches "Backport changes to ...."
+          if [[ "$PR_TITLE" =~ ^Backport[[:space:]]changes[[:space:]]to ]]; then
+            echo "Match found!"
+            echo "MATCHED=true" >> $GITHUB_ENV
+          else
+            echo "No match."
+            echo "MATCHED=false" >> $GITHUB_ENV
+          fi
+
+      - name: Send Pushover Notification
+        if: env.MATCHED == 'true'
+        run: |
+          curl -s \
+            --form-string "token=${{ secrets.PUSHOVER_APP_TOKEN }}" \
+            --form-string "user=${{ secrets.PUSHOVER_USER_KEY }}" \
+            --form-string "title=New Backport PR Detected 🚀" \
+            --form-string "message=PR Title: ${{ github.event.pull_request.title }}" \
+            --form-string "url=${{ github.event.pull_request.html_url }}" \
+            --form-string "url_title=View Pull Request on GitHub" \
+            https://api.pushover.net/1/messages.json
