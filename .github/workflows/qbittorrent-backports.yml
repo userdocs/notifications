@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Restore seen PRs cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: seen_prs.txt
           key: seen-prs-cache
@@ -45,7 +45,7 @@ jobs:
           fi
 
       - name: Save seen PRs cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: seen_prs.txt
           key: seen-prs-${{ github.run_id }}
