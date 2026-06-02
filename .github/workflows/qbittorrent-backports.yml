@@ -2,6 +2,11 @@ name: Monitor Backport PRs
 
 on:
   workflow_dispatch:
+    inputs:
+      force_recheck:
+        description: "Clear seen PR list and re-notify all open backport PRs"
+        type: boolean
+        default: false
   schedule:
     - cron: "0 * * * *"
 
@@ -19,7 +24,12 @@ jobs:
       - name: Fetch and check PRs
         id: fetch-prs
         run: |
-          touch seen_prs.txt
+          if [[ "${{ inputs.force_recheck }}" == "true" ]]; then
+            echo "Force recheck requested, clearing seen PR list"
+            > seen_prs.txt
+          else
+            touch seen_prs.txt
+          fi
           > new_matches.txt
 
           PRS=$(curl -s \
