@@ -1,36 +1,65 @@
 name: Monitor Backport PRs
 
 on:
-  pull_request:
-    types: [opened, edited]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"
 
 jobs:
   check-and-notify:
     runs-on: ubuntu-latest
     steps:
-      - name: Check PR Title
-        id: match-title
+      - name: Restore seen PRs cache
+        uses: actions/cache/restore@v4
+        with:
+          path: seen_prs.txt
+          key: seen-prs-cache
+          restore-keys: seen-prs-
+
+      - name: Fetch and check PRs
+        id: fetch-prs
         run: |
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          echo "Checking PR Title: $PR_TITLE"
-          
-          # Regex matches "Backport changes to ...."
-          if [[ "$PR_TITLE" =~ ^Backport[[:space:]]changes[[:space:]]to ]]; then
-            echo "Match found!"
-            echo "MATCHED=true" >> $GITHUB_ENV
+          touch seen_prs.txt
+          > new_matches.txt
+
+          PRS=$(curl -s \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/qbittorrent/qBittorrent/pulls?state=open&per_page=100")
+
+          while IFS= read -r pr; do
+            PR_NUMBER=$(echo "$pr" | jq -r '.number')
+            PR_TITLE=$(echo "$pr" | jq -r '.title')
+            PR_URL=$(echo "$pr" | jq -r '.html_url')
+
+            if [[ "$PR_TITLE" =~ ^Backport[[:space:]]changes[[:space:]]to ]] &&
+              ! grep -qx "$PR_NUMBER" seen_prs.txt; then
+              echo "$PR_NUMBER" >> seen_prs.txt
+              printf '%s|%s\n' "$PR_TITLE" "$PR_URL" >> new_matches.txt
+            fi
+          done < <(echo "$PRS" | jq -c '.[]')
+
+          if [ -s new_matches.txt ]; then
+            echo "MATCHED=true" >> "$GITHUB_ENV"
           else
-            echo "No match."
-            echo "MATCHED=false" >> $GITHUB_ENV
+            echo "MATCHED=false" >> "$GITHUB_ENV"
           fi
 
-      - name: Send Pushover Notification
+      - name: Save seen PRs cache
+        uses: actions/cache/save@v4
+        with:
+          path: seen_prs.txt
+          key: seen-prs-${{ github.run_id }}
+
+      - name: Send Pushover Notifications
         if: env.MATCHED == 'true'
         run: |
-          curl -s \
-            --form-string "token=${{ secrets.PUSHOVER_APP_TOKEN }}" \
-            --form-string "user=${{ secrets.PUSHOVER_USER_KEY }}" \
-            --form-string "title=New Backport PR Detected 🚀" \
-            --form-string "message=PR Title: ${{ github.event.pull_request.title }}" \
-            --form-string "url=${{ github.event.pull_request.html_url }}" \
-            --form-string "url_title=View Pull Request on GitHub" \
-            https://api.pushover.net/1/messages.json
+          while IFS='|' read -r title url; do
+            curl -s \
+              --form-string "token=${{ secrets.PUSHOVER_APP_TOKEN }}" \
+              --form-string "user=${{ secrets.PUSHOVER_USER_KEY }}" \
+              --form-string "title=New Backport PR Detected" \
+              --form-string "message=PR Title: $title" \
+              --form-string "url=$url" \
+              --form-string "url_title=View Pull Request on GitHub" \
+              https://api.pushover.net/1/messages.json
+          done < new_matches.txt
