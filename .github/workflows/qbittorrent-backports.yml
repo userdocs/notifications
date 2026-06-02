@@ -24,16 +24,21 @@ jobs:
 
           PRS=$(curl -s \
             -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/qbittorrent/qBittorrent/pulls?state=open&per_page=100")
+
+          echo "API response length: ${#PRS}"
 
           while IFS= read -r pr; do
             PR_NUMBER=$(echo "$pr" | jq -r '.number')
             PR_TITLE=$(echo "$pr" | jq -r '.title')
             PR_URL=$(echo "$pr" | jq -r '.html_url')
 
+            echo "Checking PR #$PR_NUMBER: $PR_TITLE"
+
             if [[ "$PR_TITLE" =~ ^Backport[[:space:]]changes[[:space:]]to ]] &&
               ! grep -qx "$PR_NUMBER" seen_prs.txt; then
-              echo "$PR_NUMBER" >> seen_prs.txt
+              echo "  -> New match, queuing notification"
               printf '%s|%s\n' "$PR_TITLE" "$PR_URL" >> new_matches.txt
             fi
           done < <(echo "$PRS" | jq -c '.[]')
@@ -43,12 +48,6 @@ jobs:
           else
             echo "MATCHED=false" >> "$GITHUB_ENV"
           fi
-
-      - name: Save seen PRs cache
-        uses: actions/cache/save@v5
-        with:
-          path: seen_prs.txt
-          key: seen-prs-${{ github.run_id }}
 
       - name: Send Pushover Notifications
         if: env.MATCHED == 'true'
@@ -63,3 +62,16 @@ jobs:
               --form-string "url_title=View Pull Request on GitHub" \
               https://api.pushover.net/1/messages.json
           done < new_matches.txt
+
+          # Mark notified PRs as seen only after successful notification delivery
+          while IFS='|' read -r title url; do
+            PR_NUMBER=$(echo "$url" | grep -oP '\d+$')
+            echo "$PR_NUMBER" >> seen_prs.txt
+          done < new_matches.txt
+
+      - name: Save seen PRs cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: seen_prs.txt
+          key: seen-prs-${{ github.run_id }}
