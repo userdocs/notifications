@@ -31,6 +31,7 @@ jobs:
             touch seen_prs.txt
           fi
           > new_matches.txt
+          > updated_matches.txt
 
           PRS=$(curl -s \
             -H "Accept: application/vnd.github+json" \
@@ -43,24 +44,49 @@ jobs:
             PR_NUMBER=$(echo "$pr" | jq -r '.number')
             PR_TITLE=$(echo "$pr" | jq -r '.title')
             PR_URL=$(echo "$pr" | jq -r '.html_url')
+            PR_UPDATED=$(echo "$pr" | jq -r '.updated_at')
 
-            echo "Checking PR #$PR_NUMBER: $PR_TITLE"
+            echo "Checking PR #$PR_NUMBER: $PR_TITLE (updated: $PR_UPDATED)"
 
-            if [[ "$PR_TITLE" =~ ^Backport[[:space:]]changes[[:space:]]to ]] &&
-              ! grep -qx "$PR_NUMBER" seen_prs.txt; then
-              echo "  -> New match, queuing notification"
-              printf '%s|%s|%s\n' "$PR_NUMBER" "$PR_TITLE" "$PR_URL" >> new_matches.txt
+            if [[ "$PR_TITLE" =~ ^Backport[[:space:]]changes[[:space:]]to ]]; then
+              # Check if we've seen this PR before
+              SEEN_LINE=$(grep "^${PR_NUMBER}|" seen_prs.txt || true)
+
+              if [[ -z "$SEEN_LINE" ]]; then
+                echo "  -> New backport PR, queuing notification"
+                printf '%s|%s|%s\n' "$PR_NUMBER" "$PR_TITLE" "$PR_URL" >> new_matches.txt
+              else
+                # Extract the stored updated_at timestamp
+                SEEN_UPDATED=$(echo "$SEEN_LINE" | cut -d'|' -f2)
+                if [[ "$PR_UPDATED" != "$SEEN_UPDATED" ]]; then
+                  echo "  -> PR updated since last check (was: $SEEN_UPDATED, now: $PR_UPDATED)"
+                  printf '%s|%s|%s\n' "$PR_NUMBER" "$PR_TITLE" "$PR_URL" >> updated_matches.txt
+                else
+                  echo "  -> No changes since last check"
+                fi
+              fi
+
+              # Update the seen record with current timestamp (remove old entry, add new)
+              grep -v "^${PR_NUMBER}|" seen_prs.txt > seen_prs_tmp.txt || true
+              mv seen_prs_tmp.txt seen_prs.txt
+              echo "${PR_NUMBER}|${PR_UPDATED}" >> seen_prs.txt
             fi
           done < <(echo "$PRS" | jq -c '.[]')
 
           if [ -s new_matches.txt ]; then
-            echo "MATCHED=true" >> "$GITHUB_ENV"
+            echo "HAS_NEW=true" >> "$GITHUB_ENV"
           else
-            echo "MATCHED=false" >> "$GITHUB_ENV"
+            echo "HAS_NEW=false" >> "$GITHUB_ENV"
           fi
 
-      - name: Send Pushover Notifications
-        if: env.MATCHED == 'true'
+          if [ -s updated_matches.txt ]; then
+            echo "HAS_UPDATED=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_UPDATED=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Send notifications for new PRs
+        if: env.HAS_NEW == 'true'
         run: |
           while IFS='|' read -r number title url; do
             curl -s \
@@ -74,21 +100,46 @@ jobs:
               https://api.pushover.net/1/messages.json
           done < new_matches.txt
 
-          # Mark notified PRs as seen by their PR number
+      - name: Send notifications for updated PRs
+        if: env.HAS_UPDATED == 'true'
+        run: |
           while IFS='|' read -r number title url; do
-            echo "$number" >> seen_prs.txt
-          done < new_matches.txt
+            curl -s \
+              --form-string "token=${{ secrets.PUSHOVER_APP_TOKEN }}" \
+              --form-string "user=${{ secrets.PUSHOVER_USER_KEY }}" \
+              --form-string "title=Backport PR Updated" \
+              --form-string "message=PR #${number} has been updated since last check.
+          Title: $title" \
+              --form-string "url=$url" \
+              --form-string "url_title=View Pull Request on GitHub" \
+              --form-string "sound=pushover" \
+              https://api.pushover.net/1/messages.json
+          done < updated_matches.txt
 
       - name: Output summary
-        if: env.MATCHED == 'true'
+        if: env.HAS_NEW == 'true' || env.HAS_UPDATED == 'true'
         run: |
           echo "## Backport PRs Notified" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| PR | Title | Patch URL |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          while IFS='|' read -r number title url; do
-            echo "| #${number} | ${title} | ${url}.patch |" >> "$GITHUB_STEP_SUMMARY"
-          done < new_matches.txt
+
+          if [ -s new_matches.txt ]; then
+            echo "### New PRs" >> "$GITHUB_STEP_SUMMARY"
+            echo "| PR | Title | Patch URL |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            while IFS='|' read -r number title url; do
+              echo "| #${number} | ${title} | ${url}.patch |" >> "$GITHUB_STEP_SUMMARY"
+            done < new_matches.txt
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -s updated_matches.txt ]; then
+            echo "### Updated PRs" >> "$GITHUB_STEP_SUMMARY"
+            echo "| PR | Title | Patch URL |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            while IFS='|' read -r number title url; do
+              echo "| #${number} | ${title} | ${url}.patch |" >> "$GITHUB_STEP_SUMMARY"
+            done < updated_matches.txt
+          fi
 
       - name: Save seen PRs cache
         if: always()
