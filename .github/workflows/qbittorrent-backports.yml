@@ -96,8 +96,8 @@ jobs:
             if [[ -z "$PREV_STATE" ]]; then
               echo "  -> New backport PR"
 
-              # Build new PR notification payload
-              jq -n \
+              # Build new PR notification payload (compact: one JSON object per line)
+              jq -cn \
                 --arg number "$PR_NUMBER" \
                 --arg title "$PR_TITLE" \
                 --arg url "$PR_URL" \
@@ -151,7 +151,7 @@ jobs:
                   CHANGES="Activity detected (comments, reviews, or labels)"
                 fi
 
-                jq -n \
+                jq -cn \
                   --arg number "$PR_NUMBER" \
                   --arg title "$PR_TITLE" \
                   --arg url "$PR_URL" \
