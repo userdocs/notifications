@@ -17,69 +17,181 @@ jobs:
       - name: Restore seen PRs cache
         uses: actions/cache/restore@v5
         with:
-          path: seen_prs.txt
+          path: seen_prs.json
           key: seen-prs-cache
           restore-keys: seen-prs-
 
       - name: Fetch and check PRs
         id: fetch-prs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [[ "${{ inputs.force_recheck }}" == "true" ]]; then
             echo "Force recheck requested, clearing seen PR list"
-            > seen_prs.txt
+            echo '{}' > seen_prs.json
           else
-            touch seen_prs.txt
+            # Ensure file exists with valid JSON
+            if [ ! -s seen_prs.json ] || ! jq empty seen_prs.json 2>/dev/null; then
+              echo '{}' > seen_prs.json
+            fi
           fi
-          > new_matches.txt
-          > updated_matches.txt
+
+          > new_notifications.json
+          > updated_notifications.json
 
           PRS=$(curl -s \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/qbittorrent/qBittorrent/pulls?state=open&per_page=100")
 
-          echo "API response length: ${#PRS}"
+          echo "Fetched $(echo "$PRS" | jq 'length') open PRs"
 
           while IFS= read -r pr; do
             PR_NUMBER=$(echo "$pr" | jq -r '.number')
             PR_TITLE=$(echo "$pr" | jq -r '.title')
             PR_URL=$(echo "$pr" | jq -r '.html_url')
             PR_UPDATED=$(echo "$pr" | jq -r '.updated_at')
+            PR_BODY=$(echo "$pr" | jq -r '.body // ""')
+            PR_USER=$(echo "$pr" | jq -r '.user.login')
+            PR_BASE=$(echo "$pr" | jq -r '.base.ref')
+            PR_CREATED=$(echo "$pr" | jq -r '.created_at')
 
-            echo "Checking PR #$PR_NUMBER: $PR_TITLE (updated: $PR_UPDATED)"
-
-            if [[ "$PR_TITLE" =~ ^Backport[[:space:]]changes[[:space:]]to ]]; then
-              # Check if we've seen this PR before
-              SEEN_LINE=$(grep "^${PR_NUMBER}|" seen_prs.txt || true)
-
-              if [[ -z "$SEEN_LINE" ]]; then
-                echo "  -> New backport PR, queuing notification"
-                printf '%s|%s|%s\n' "$PR_NUMBER" "$PR_TITLE" "$PR_URL" >> new_matches.txt
-              else
-                # Extract the stored updated_at timestamp
-                SEEN_UPDATED=$(echo "$SEEN_LINE" | cut -d'|' -f2)
-                if [[ "$PR_UPDATED" != "$SEEN_UPDATED" ]]; then
-                  echo "  -> PR updated since last check (was: $SEEN_UPDATED, now: $PR_UPDATED)"
-                  printf '%s|%s|%s\n' "$PR_NUMBER" "$PR_TITLE" "$PR_URL" >> updated_matches.txt
-                else
-                  echo "  -> No changes since last check"
-                fi
-              fi
-
-              # Update the seen record with current timestamp (remove old entry, add new)
-              grep -v "^${PR_NUMBER}|" seen_prs.txt > seen_prs_tmp.txt || true
-              mv seen_prs_tmp.txt seen_prs.txt
-              echo "${PR_NUMBER}|${PR_UPDATED}" >> seen_prs.txt
+            if [[ ! "$PR_TITLE" =~ ^Backport[[:space:]]changes[[:space:]]to ]]; then
+              continue
             fi
+
+            echo "Matched backport PR #$PR_NUMBER: $PR_TITLE"
+
+            # Extract the target branch from the title
+            TARGET_BRANCH=$(echo "$PR_TITLE" | sed 's/^Backport changes to //')
+
+            # Fetch individual PR details for commit and file counts
+            PR_DETAILS=$(curl -s \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/qbittorrent/qBittorrent/pulls/$PR_NUMBER")
+
+            COMMIT_COUNT=$(echo "$PR_DETAILS" | jq -r '.commits // 0')
+            CHANGED_FILES=$(echo "$PR_DETAILS" | jq -r '.changed_files // 0')
+            ADDITIONS=$(echo "$PR_DETAILS" | jq -r '.additions // 0')
+            DELETIONS=$(echo "$PR_DETAILS" | jq -r '.deletions // 0')
+
+            # Parse backported PR references from body
+            # Look for #NNNN or full GitHub pull URLs
+            BACKPORTED_PRS=$(echo "$PR_BODY" | grep -oP '(?:#|qbittorrent/qBittorrent/pull/)(\d+)' | grep -oP '\d+' | sort -un | tr '\n' ',' | sed 's/,$//')
+
+            if [ -z "$BACKPORTED_PRS" ]; then
+              BACKPORTED_PRS="(none listed)"
+              BACKPORTED_COUNT=0
+            else
+              BACKPORTED_COUNT=$(echo "$BACKPORTED_PRS" | tr ',' '\n' | wc -l)
+            fi
+
+            # Hash the body to detect description-only changes
+            BODY_HASH=$(echo "$PR_BODY" | md5sum | cut -d' ' -f1)
+
+            # Check previous state from cache
+            PREV_STATE=$(jq -r --arg num "$PR_NUMBER" '.[$num] // empty' seen_prs.json)
+
+            if [[ -z "$PREV_STATE" ]]; then
+              echo "  -> New backport PR"
+
+              # Build new PR notification payload
+              jq -n \
+                --arg number "$PR_NUMBER" \
+                --arg title "$PR_TITLE" \
+                --arg url "$PR_URL" \
+                --arg branch "$TARGET_BRANCH" \
+                --arg user "$PR_USER" \
+                --arg commits "$COMMIT_COUNT" \
+                --arg files "$CHANGED_FILES" \
+                --arg adds "$ADDITIONS" \
+                --arg dels "$DELETIONS" \
+                --arg backported "$BACKPORTED_PRS" \
+                --arg bp_count "$BACKPORTED_COUNT" \
+                '{number: $number, title: $title, url: $url, branch: $branch,
+                  user: $user, commits: $commits, files: $files,
+                  additions: $adds, deletions: $dels,
+                  backported_prs: $backported, backported_count: $bp_count}' >> new_notifications.json
+            else
+              PREV_UPDATED=$(echo "$PREV_STATE" | jq -r '.updated_at')
+              if [[ "$PR_UPDATED" != "$PREV_UPDATED" ]]; then
+                echo "  -> PR updated (was: $PREV_UPDATED, now: $PR_UPDATED)"
+
+                PREV_COMMITS=$(echo "$PREV_STATE" | jq -r '.commits // "0"')
+                PREV_BODY_HASH=$(echo "$PREV_STATE" | jq -r '.body_hash // ""')
+                PREV_BACKPORTED=$(echo "$PREV_STATE" | jq -r '.backported_prs // ""')
+
+                # Determine what changed
+                CHANGES=""
+                if [[ "$COMMIT_COUNT" != "$PREV_COMMITS" ]]; then
+                  NEW_COMMITS=$((COMMIT_COUNT - PREV_COMMITS))
+                  if [[ $NEW_COMMITS -gt 0 ]]; then
+                    CHANGES="${CHANGES}${NEW_COMMITS} new commit(s) pushed (${PREV_COMMITS} → ${COMMIT_COUNT})\n"
+                  else
+                    CHANGES="${CHANGES}Commits changed (${PREV_COMMITS} → ${COMMIT_COUNT}, possible force-push)\n"
+                  fi
+                fi
+
+                if [[ "$BODY_HASH" != "$PREV_BODY_HASH" ]]; then
+                  # Find newly added backported PRs
+                  if [[ "$BACKPORTED_PRS" != "(none listed)" && -n "$PREV_BACKPORTED" && "$PREV_BACKPORTED" != "(none listed)" ]]; then
+                    NEW_BPS=$(comm -13 <(echo "$PREV_BACKPORTED" | tr ',' '\n' | sort) <(echo "$BACKPORTED_PRS" | tr ',' '\n' | sort) | tr '\n' ',' | sed 's/,$//')
+                    if [[ -n "$NEW_BPS" ]]; then
+                      CHANGES="${CHANGES}New PRs added to backport: #$(echo "$NEW_BPS" | sed 's/,/, #/g')\n"
+                    else
+                      CHANGES="${CHANGES}PR description updated\n"
+                    fi
+                  else
+                    CHANGES="${CHANGES}PR description updated\n"
+                  fi
+                fi
+
+                if [[ -z "$CHANGES" ]]; then
+                  CHANGES="Activity detected (comments, reviews, or labels)"
+                fi
+
+                jq -n \
+                  --arg number "$PR_NUMBER" \
+                  --arg title "$PR_TITLE" \
+                  --arg url "$PR_URL" \
+                  --arg branch "$TARGET_BRANCH" \
+                  --arg user "$PR_USER" \
+                  --arg commits "$COMMIT_COUNT" \
+                  --arg files "$CHANGED_FILES" \
+                  --arg adds "$ADDITIONS" \
+                  --arg dels "$DELETIONS" \
+                  --arg backported "$BACKPORTED_PRS" \
+                  --arg bp_count "$BACKPORTED_COUNT" \
+                  --arg changes "$CHANGES" \
+                  '{number: $number, title: $title, url: $url, branch: $branch,
+                    user: $user, commits: $commits, files: $files,
+                    additions: $adds, deletions: $dels,
+                    backported_prs: $backported, backported_count: $bp_count,
+                    changes: $changes}' >> updated_notifications.json
+              else
+                echo "  -> No changes since last check"
+              fi
+            fi
+
+            # Update the cache with current state
+            jq --arg num "$PR_NUMBER" \
+               --arg updated "$PR_UPDATED" \
+               --arg commits "$COMMIT_COUNT" \
+               --arg hash "$BODY_HASH" \
+               --arg bps "$BACKPORTED_PRS" \
+               '.[$num] = {updated_at: $updated, commits: $commits, body_hash: $hash, backported_prs: $bps}' \
+               seen_prs.json > seen_prs_tmp.json && mv seen_prs_tmp.json seen_prs.json
+
           done < <(echo "$PRS" | jq -c '.[]')
 
-          if [ -s new_matches.txt ]; then
+          if [ -s new_notifications.json ]; then
             echo "HAS_NEW=true" >> "$GITHUB_ENV"
           else
             echo "HAS_NEW=false" >> "$GITHUB_ENV"
           fi
 
-          if [ -s updated_matches.txt ]; then
+          if [ -s updated_notifications.json ]; then
             echo "HAS_UPDATED=true" >> "$GITHUB_ENV"
           else
             echo "HAS_UPDATED=false" >> "$GITHUB_ENV"
@@ -88,33 +200,83 @@ jobs:
       - name: Send notifications for new PRs
         if: env.HAS_NEW == 'true'
         run: |
-          while IFS='|' read -r number title url; do
+          while IFS= read -r entry; do
+            NUMBER=$(echo "$entry" | jq -r '.number')
+            TITLE=$(echo "$entry" | jq -r '.title')
+            URL=$(echo "$entry" | jq -r '.url')
+            BRANCH=$(echo "$entry" | jq -r '.branch')
+            USER=$(echo "$entry" | jq -r '.user')
+            COMMITS=$(echo "$entry" | jq -r '.commits')
+            FILES=$(echo "$entry" | jq -r '.files')
+            ADDS=$(echo "$entry" | jq -r '.additions')
+            DELS=$(echo "$entry" | jq -r '.deletions')
+            BP_PRS=$(echo "$entry" | jq -r '.backported_prs')
+            BP_COUNT=$(echo "$entry" | jq -r '.backported_count')
+
+            # Format the backported PR list with # prefix
+            if [[ "$BP_PRS" != "(none listed)" ]]; then
+              BP_DISPLAY=$(echo "$BP_PRS" | sed 's/\([0-9]\+\)/#\1/g')
+            else
+              BP_DISPLAY="(none listed)"
+            fi
+
+            MESSAGE="Branch: ${BRANCH}
+          Author: ${USER}
+          Commits: ${COMMITS} | Files: ${FILES} (+${ADDS} -${DELS})
+
+          Backported PRs (${BP_COUNT}):
+          ${BP_DISPLAY}"
+
             curl -s \
               --form-string "token=${{ secrets.PUSHOVER_APP_TOKEN }}" \
               --form-string "user=${{ secrets.PUSHOVER_USER_KEY }}" \
-              --form-string "title=New Backport PR Detected" \
-              --form-string "message=PR Title: $title" \
-              --form-string "url=$url" \
-              --form-string "url_title=View Pull Request on GitHub" \
+              --form-string "title=🆕 Backport PR #${NUMBER}" \
+              --form-string "message=${MESSAGE}" \
+              --form-string "url=${URL}" \
+              --form-string "url_title=View PR #${NUMBER} on GitHub" \
               --form-string "sound=siren" \
+              --form-string "html=0" \
               https://api.pushover.net/1/messages.json
-          done < new_matches.txt
+          done < new_notifications.json
 
       - name: Send notifications for updated PRs
         if: env.HAS_UPDATED == 'true'
         run: |
-          while IFS='|' read -r number title url; do
+          while IFS= read -r entry; do
+            NUMBER=$(echo "$entry" | jq -r '.number')
+            URL=$(echo "$entry" | jq -r '.url')
+            BRANCH=$(echo "$entry" | jq -r '.branch')
+            COMMITS=$(echo "$entry" | jq -r '.commits')
+            FILES=$(echo "$entry" | jq -r '.files')
+            ADDS=$(echo "$entry" | jq -r '.additions')
+            DELS=$(echo "$entry" | jq -r '.deletions')
+            BP_PRS=$(echo "$entry" | jq -r '.backported_prs')
+            BP_COUNT=$(echo "$entry" | jq -r '.backported_count')
+            CHANGES=$(echo "$entry" | jq -r '.changes')
+
+            if [[ "$BP_PRS" != "(none listed)" ]]; then
+              BP_DISPLAY=$(echo "$BP_PRS" | sed 's/\([0-9]\+\)/#\1/g')
+            else
+              BP_DISPLAY="(none listed)"
+            fi
+
+            MESSAGE="Branch: ${BRANCH}
+          What changed:
+          $(echo -e "$CHANGES")
+          Current stats: ${COMMITS} commits | ${FILES} files (+${ADDS} -${DELS})
+          Backported PRs (${BP_COUNT}): ${BP_DISPLAY}"
+
             curl -s \
               --form-string "token=${{ secrets.PUSHOVER_APP_TOKEN }}" \
               --form-string "user=${{ secrets.PUSHOVER_USER_KEY }}" \
-              --form-string "title=Backport PR Updated" \
-              --form-string "message=PR #${number} has been updated since last check.
-          Title: $title" \
-              --form-string "url=$url" \
-              --form-string "url_title=View Pull Request on GitHub" \
+              --form-string "title=🔄 Backport PR #${NUMBER} Updated" \
+              --form-string "message=${MESSAGE}" \
+              --form-string "url=${URL}" \
+              --form-string "url_title=View PR #${NUMBER} on GitHub" \
               --form-string "sound=pushover" \
+              --form-string "html=0" \
               https://api.pushover.net/1/messages.json
-          done < updated_matches.txt
+          done < updated_notifications.json
 
       - name: Output summary
         if: env.HAS_NEW == 'true' || env.HAS_UPDATED == 'true'
@@ -122,28 +284,41 @@ jobs:
           echo "## Backport PRs Notified" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          if [ -s new_matches.txt ]; then
-            echo "### New PRs" >> "$GITHUB_STEP_SUMMARY"
-            echo "| PR | Title | Patch URL |" >> "$GITHUB_STEP_SUMMARY"
-            echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
-            while IFS='|' read -r number title url; do
-              echo "| #${number} | ${title} | ${url}.patch |" >> "$GITHUB_STEP_SUMMARY"
-            done < new_matches.txt
+          if [ -s new_notifications.json ]; then
+            echo "### 🆕 New PRs" >> "$GITHUB_STEP_SUMMARY"
+            echo "| PR | Branch | Commits | Files | Backported PRs |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r entry; do
+              NUM=$(echo "$entry" | jq -r '.number')
+              BRANCH=$(echo "$entry" | jq -r '.branch')
+              COMMITS=$(echo "$entry" | jq -r '.commits')
+              FILES=$(echo "$entry" | jq -r '.files')
+              BPS=$(echo "$entry" | jq -r '.backported_prs' | sed 's/\([0-9]\+\)/#\1/g')
+              URL=$(echo "$entry" | jq -r '.url')
+              echo "| [#${NUM}](${URL}) | \`${BRANCH}\` | ${COMMITS} | ${FILES} | ${BPS} |" >> "$GITHUB_STEP_SUMMARY"
+            done < new_notifications.json
             echo "" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          if [ -s updated_matches.txt ]; then
-            echo "### Updated PRs" >> "$GITHUB_STEP_SUMMARY"
-            echo "| PR | Title | Patch URL |" >> "$GITHUB_STEP_SUMMARY"
-            echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
-            while IFS='|' read -r number title url; do
-              echo "| #${number} | ${title} | ${url}.patch |" >> "$GITHUB_STEP_SUMMARY"
-            done < updated_matches.txt
+          if [ -s updated_notifications.json ]; then
+            echo "### 🔄 Updated PRs" >> "$GITHUB_STEP_SUMMARY"
+            echo "| PR | Branch | What Changed | Commits | Files | Backported PRs |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r entry; do
+              NUM=$(echo "$entry" | jq -r '.number')
+              BRANCH=$(echo "$entry" | jq -r '.branch')
+              COMMITS=$(echo "$entry" | jq -r '.commits')
+              FILES=$(echo "$entry" | jq -r '.files')
+              BPS=$(echo "$entry" | jq -r '.backported_prs' | sed 's/\([0-9]\+\)/#\1/g')
+              URL=$(echo "$entry" | jq -r '.url')
+              CHANGES=$(echo "$entry" | jq -r '.changes' | tr '\n' ' ' | sed 's/\\n/ | /g')
+              echo "| [#${NUM}](${URL}) | \`${BRANCH}\` | ${CHANGES} | ${COMMITS} | ${FILES} | ${BPS} |" >> "$GITHUB_STEP_SUMMARY"
+            done < updated_notifications.json
           fi
 
       - name: Save seen PRs cache
         if: always()
         uses: actions/cache/save@v5
         with:
-          path: seen_prs.txt
+          path: seen_prs.json
           key: seen-prs-${{ github.run_id }}
